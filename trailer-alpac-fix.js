@@ -1,7 +1,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '1.2.0';
+  var VERSION = '1.3.0';
   var FALLBACK_HOST = 'https://beta.l-vid.online/';
   var installed = false;
   var originalPlay = null;
@@ -175,106 +175,36 @@
     } catch (e) {}
   }
 
-  function resolveViaYoutube(host, id, title, onDone) {
-    var url = host + 'lite/youtube?videoID=' + encodeURIComponent(id) +
-      '&title=' + encodeURIComponent(title) + '&rjson=true';
+  function pickPipedStream(json) {
+    var list = json && json.videoStreams ? json.videoStreams.slice() : [];
 
-    url = authenticatedUrl(url);
-
-    var net = new Lampa.Reguest();
-    net.timeout(120000);
-
-    net.silent(
-      url,
-      function (json) {
-        var row = json && json.data && json.data.length ? json.data[0] : null;
-        var stream = row && (row.stream || row.url);
-
-        if (stream) {
-          onDone(true, row, absoluteStream(host, stream));
-        } else {
-          onDone(false, json || null, '');
-        }
-      },
-      function (err) {
-        onDone(false, err || null, '');
-      },
-      false,
-      { headers: requestHeaders() }
-    );
-  }
-
-  function qualityNumber(item) {
-    var s = String((item && (item.qualityLabel || item.quality || item.resolution)) || '');
-    var m = s.match(/(\d{3,4})/);
-    return m ? parseInt(m[1], 10) : 0;
-  }
-
-  function pickInvidiousStream(json) {
-    var list = json && json.formatStreams ? json.formatStreams.slice() : [];
-    if (!list.length) return '';
-
-    // Progressive streams contain both video and audio and are the safest for
-    // Samsung/Tizen. Prefer MP4 and the highest resolution up to 1080p.
-    list = list.filter(function (x) {
-      return x && x.url && (!x.container || String(x.container).toLowerCase() === 'mp4');
+    // Progressive MP4 (videoOnly=false) is safest for Samsung/Tizen.
+    var progressive = list.filter(function (x) {
+      return x && x.url && x.videoOnly === false &&
+        (!x.mimeType || String(x.mimeType).toLowerCase().indexOf('video/mp4') === 0);
     });
 
-    if (!list.length && json && json.formatStreams) list = json.formatStreams.slice();
-
-    list.sort(function (a, b) {
-      var qa = qualityNumber(a);
-      var qb = qualityNumber(b);
-      var sa = qa > 1080 ? -1 : qa;
-      var sb = qb > 1080 ? -1 : qb;
-      return sb - sa;
-    });
-
-    return list.length && list[0].url ? String(list[0].url) : '';
-  }
-
-  function resolveViaInvidious(id, title, onDone) {
-    var hosts = [
-      'https://inv.nadeko.net',
-      'https://invidious.nerdvpn.de',
-      'https://yt.chocolatemoo53.com',
-      'https://invidious.tiekoetter.com'
-    ];
-
-    var index = 0;
-
-    function next() {
-      if (index >= hosts.length) {
-        onDone(false, null, '');
-        return;
-      }
-
-      var host = hosts[index++];
-      var url = host + '/api/v1/videos/' + encodeURIComponent(id) + '?local=true';
-      var net = new Lampa.Reguest();
-      net.timeout(25000);
-
-      net.silent(
-        url,
-        function (json) {
-          var stream = pickInvidiousStream(json);
-          if (stream) {
-            log('resolved via Invidious', host, id, stream);
-            onDone(true, {
-              title: title,
-              duration: json && json.lengthSeconds ? parseInt(json.lengthSeconds, 10) : 0
-            }, stream);
-          } else {
-            next();
-          }
-        },
-        function () {
-          next();
-        }
-      );
+    if (!progressive.length) {
+      progressive = list.filter(function (x) {
+        return x && x.url && x.videoOnly === false;
+      });
     }
 
-    next();
+    progressive.sort(function (a, b) {
+      var ha = parseInt(a.height || 0, 10);
+      var hb = parseInt(b.height || 0, 10);
+      if (ha > 1080) ha = -1;
+      if (hb > 1080) hb = -1;
+      return hb - ha;
+    });
+
+    if (progressive.length) return String(progressive[0].url);
+
+    // Last resorts supported by Lampa Player.
+    if (json && json.hls) return String(json.hls);
+    if (json && json.dash) return String(json.dash);
+
+    return '';
   }
 
   function resolveAndPlay(item) {
@@ -285,74 +215,114 @@
 
     var host = detectAlpacHost();
     var title = item.title || 'Трейлер';
+    var finished = false;
+    var pending = 0;
+    var errors = [];
 
-    // ALPAC has a dedicated trailer resolver for exactly this scenario:
-    // TMDB YouTube id -> yt-dlp -> a stream that Lampa can play.
-    var trailerUrl = authenticatedUrl(
-      host + 'lite/trailer?id=' + encodeURIComponent(id)
-    );
-
-    var net = new Lampa.Reguest();
-    net.timeout(120000);
     loading(true);
 
-    net.silent(
-      trailerUrl,
+    function finish(row, stream, source) {
+      if (finished || !stream) return;
+      finished = true;
+      loading(false);
+      log('resolved via ' + source, id, stream);
+      playResolved(title, row || {}, stream);
+    }
+
+    function failed(source, detail) {
+      if (finished) return;
+      errors.push(source + (detail ? ': ' + detail : ''));
+      pending--;
+      if (pending <= 0) {
+        finished = true;
+        loading(false);
+        log('all resolvers failed', errors);
+        showError('Трейлер: не удалось получить видео');
+      }
+    }
+
+    function getJSON(url, timeout, headers, source, success) {
+      pending++;
+      var net = new Lampa.Reguest();
+      net.timeout(timeout);
+      net.silent(
+        url,
+        function (json) {
+          if (finished) return;
+          try {
+            if (success(json)) return;
+          } catch (e) {
+            log(source + ' parse error', e);
+          }
+          failed(source, json && json.error ? json.error : '');
+        },
+        function (err) {
+          failed(source, 'network');
+        },
+        false,
+        headers ? { headers: headers } : undefined
+      );
+    }
+
+    // 1) ALPAC dedicated trailer resolver.
+    getJSON(
+      authenticatedUrl(host + 'lite/trailer?id=' + encodeURIComponent(id)),
+      25000,
+      requestHeaders(),
+      'ALPAC',
       function (json) {
-        var direct = json && json.url ? absoluteStream(host, json.url) : '';
-
-        if (direct) {
-          loading(false);
-          log('resolved via /lite/trailer', id, direct);
-          playResolved(title, json, direct);
-          return;
-        }
-
-        // Some ALPAC nodes may not have the trailer route working even though
-        // the generic YouTube resolver does. Try that before showing an error.
-        log('/lite/trailer returned no URL, falling back to /lite/youtube', id);
-        resolveViaYoutube(host, id, title, function (ok, row, stream) {
-          loading(false);
-          if (ok && stream) {
-            log('resolved via /lite/youtube', id, stream);
-            playResolved(title, row, stream);
-          } else {
-            log('ALPAC resolvers returned no stream, trying Invidious', id);
-            resolveViaInvidious(id, title, function (ivOk, ivRow, ivStream) {
-              if (ivOk && ivStream) {
-                playResolved(title, ivRow || {}, ivStream);
-              } else {
-                var detail = row && row.error ? ': ' + row.error : '';
-                showError('Трейлер: не удалось получить видео' + detail);
-              }
-            });
-          }
-        });
-      },
-      function (err) {
-        // If the dedicated endpoint itself is unavailable, still try the
-        // generic resolver used by ALPAC's YouTube search source.
-        log('/lite/trailer request failed, fallback', err);
-        resolveViaYoutube(host, id, title, function (ok, row, stream) {
-          loading(false);
-          if (ok && stream) {
-            playResolved(title, row, stream);
-          } else {
-            log('ALPAC request failed, trying Invidious', id);
-            resolveViaInvidious(id, title, function (ivOk, ivRow, ivStream) {
-              if (ivOk && ivStream) {
-                playResolved(title, ivRow || {}, ivStream);
-              } else {
-                var detail = row && row.error ? ': ' + row.error : '';
-                showError('Трейлер: не удалось получить видео' + detail);
-              }
-            });
-          }
-        });
-      },
-      false,
-      { headers: requestHeaders() }
+        var stream = json && json.url ? absoluteStream(host, json.url) : '';
+        if (!stream) return false;
+        finish(json, stream, 'ALPAC');
+        return true;
+      }
     );
+
+    // 2) Piped public APIs. Their /streams/:id response returns proxied stream URLs.
+    [
+      'https://pipedapi.kavin.rocks',
+      'https://pipedapi.leptons.xyz',
+      'https://pipedapi.nosebs.ru'
+    ].forEach(function (apiHost) {
+      getJSON(
+        apiHost + '/streams/' + encodeURIComponent(id),
+        15000,
+        null,
+        'Piped ' + apiHost,
+        function (json) {
+          var stream = pickPipedStream(json);
+          if (!stream) return false;
+          finish({
+            title: title,
+            duration: json && json.duration ? parseInt(json.duration, 10) : 0
+          }, stream, 'Piped');
+          return true;
+        }
+      );
+    });
+
+    // 3) Current public Invidious instances. Run in parallel, not one after another.
+    [
+      'https://inv.nadeko.net',
+      'https://invidious.nerdvpn.de',
+      'https://yt.chocolatemoo53.com'
+    ].forEach(function (apiHost) {
+      getJSON(
+        apiHost + '/api/v1/videos/' + encodeURIComponent(id) + '?local=true',
+        15000,
+        null,
+        'Invidious ' + apiHost,
+        function (json) {
+          var stream = pickInvidiousStream(json);
+          if (!stream) return false;
+          finish({
+            title: title,
+            duration: json && json.lengthSeconds ? parseInt(json.lengthSeconds, 10) : 0
+          }, stream, 'Invidious');
+          return true;
+        }
+      );
+    });
   }
 
   function install() {
