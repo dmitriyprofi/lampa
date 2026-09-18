@@ -1,7 +1,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '1.1.0';
+  var VERSION = '1.2.0';
   var FALLBACK_HOST = 'https://beta.l-vid.online/';
   var installed = false;
   var originalPlay = null;
@@ -204,6 +204,79 @@
     );
   }
 
+  function qualityNumber(item) {
+    var s = String((item && (item.qualityLabel || item.quality || item.resolution)) || '');
+    var m = s.match(/(\d{3,4})/);
+    return m ? parseInt(m[1], 10) : 0;
+  }
+
+  function pickInvidiousStream(json) {
+    var list = json && json.formatStreams ? json.formatStreams.slice() : [];
+    if (!list.length) return '';
+
+    // Progressive streams contain both video and audio and are the safest for
+    // Samsung/Tizen. Prefer MP4 and the highest resolution up to 1080p.
+    list = list.filter(function (x) {
+      return x && x.url && (!x.container || String(x.container).toLowerCase() === 'mp4');
+    });
+
+    if (!list.length && json && json.formatStreams) list = json.formatStreams.slice();
+
+    list.sort(function (a, b) {
+      var qa = qualityNumber(a);
+      var qb = qualityNumber(b);
+      var sa = qa > 1080 ? -1 : qa;
+      var sb = qb > 1080 ? -1 : qb;
+      return sb - sa;
+    });
+
+    return list.length && list[0].url ? String(list[0].url) : '';
+  }
+
+  function resolveViaInvidious(id, title, onDone) {
+    var hosts = [
+      'https://inv.nadeko.net',
+      'https://invidious.nerdvpn.de',
+      'https://yt.chocolatemoo53.com',
+      'https://invidious.tiekoetter.com'
+    ];
+
+    var index = 0;
+
+    function next() {
+      if (index >= hosts.length) {
+        onDone(false, null, '');
+        return;
+      }
+
+      var host = hosts[index++];
+      var url = host + '/api/v1/videos/' + encodeURIComponent(id) + '?local=true';
+      var net = new Lampa.Reguest();
+      net.timeout(25000);
+
+      net.silent(
+        url,
+        function (json) {
+          var stream = pickInvidiousStream(json);
+          if (stream) {
+            log('resolved via Invidious', host, id, stream);
+            onDone(true, {
+              title: title,
+              duration: json && json.lengthSeconds ? parseInt(json.lengthSeconds, 10) : 0
+            }, stream);
+          } else {
+            next();
+          }
+        },
+        function () {
+          next();
+        }
+      );
+    }
+
+    next();
+  }
+
   function resolveAndPlay(item) {
     var id = youtubeId(item);
     if (!id) {
@@ -244,8 +317,15 @@
             log('resolved via /lite/youtube', id, stream);
             playResolved(title, row, stream);
           } else {
-            var detail = row && row.error ? ': ' + row.error : '';
-            showError('Трейлер: ALPAC не получил видео' + detail);
+            log('ALPAC resolvers returned no stream, trying Invidious', id);
+            resolveViaInvidious(id, title, function (ivOk, ivRow, ivStream) {
+              if (ivOk && ivStream) {
+                playResolved(title, ivRow || {}, ivStream);
+              } else {
+                var detail = row && row.error ? ': ' + row.error : '';
+                showError('Трейлер: не удалось получить видео' + detail);
+              }
+            });
           }
         });
       },
@@ -258,8 +338,15 @@
           if (ok && stream) {
             playResolved(title, row, stream);
           } else {
-            var detail = row && row.error ? ': ' + row.error : '';
-            showError('Трейлер: ошибка ALPAC' + detail);
+            log('ALPAC request failed, trying Invidious', id);
+            resolveViaInvidious(id, title, function (ivOk, ivRow, ivStream) {
+              if (ivOk && ivStream) {
+                playResolved(title, ivRow || {}, ivStream);
+              } else {
+                var detail = row && row.error ? ': ' + row.error : '';
+                showError('Трейлер: не удалось получить видео' + detail);
+              }
+            });
           }
         });
       },
