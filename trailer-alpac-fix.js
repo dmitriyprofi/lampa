@@ -1,7 +1,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '1.0.0';
+  var VERSION = '1.1.0';
   var FALLBACK_HOST = 'https://beta.l-vid.online/';
   var installed = false;
   var originalPlay = null;
@@ -139,6 +139,71 @@
     } catch (e) {}
   }
 
+  function absoluteStream(host, value) {
+    value = String(value || '').trim();
+    if (!value) return '';
+    if (/^https?:\/\//i.test(value)) return value;
+
+    var base = host.replace(/\/$/, '');
+    if (value.charAt(0) === '/') return base + value;
+
+    // ALPAC /lite/trailer currently returns the encrypted proxy token itself
+    // on some builds rather than a complete /proxy/... URL.
+    if (value.indexOf('proxy/') === 0) return base + '/' + value;
+    return base + '/proxy/' + value;
+  }
+
+  function playResolved(title, row, stream) {
+    var playItem = {
+      title: title,
+      url: stream,
+      stream: stream,
+      quality: row && (row.quality || row.qualitys),
+      qualitys: row && (row.qualitys || row.quality),
+      duration: row && row.duration,
+      hls_manifest_timeout: row && row.hls_manifest_timeout || 180000,
+      __alpac_trailer_resolved: true
+    };
+
+    if (row && row.audio) playItem.audio = row.audio;
+    if (row && row.dash) playItem.dash = row.dash;
+
+    originalPlay.call(Lampa.Player, playItem);
+
+    try {
+      if (originalPlaylist) originalPlaylist.call(Lampa.Player, [playItem]);
+    } catch (e) {}
+  }
+
+  function resolveViaYoutube(host, id, title, onDone) {
+    var url = host + 'lite/youtube?videoID=' + encodeURIComponent(id) +
+      '&title=' + encodeURIComponent(title) + '&rjson=true';
+
+    url = authenticatedUrl(url);
+
+    var net = new Lampa.Reguest();
+    net.timeout(120000);
+
+    net.silent(
+      url,
+      function (json) {
+        var row = json && json.data && json.data.length ? json.data[0] : null;
+        var stream = row && (row.stream || row.url);
+
+        if (stream) {
+          onDone(true, row, absoluteStream(host, stream));
+        } else {
+          onDone(false, json || null, '');
+        }
+      },
+      function (err) {
+        onDone(false, err || null, '');
+      },
+      false,
+      { headers: requestHeaders() }
+    );
+  }
+
   function resolveAndPlay(item) {
     var id = youtubeId(item);
     if (!id) {
@@ -147,59 +212,56 @@
 
     var host = detectAlpacHost();
     var title = item.title || 'Трейлер';
-    var url = host + 'lite/youtube?videoID=' + encodeURIComponent(id) +
-      '&title=' + encodeURIComponent(title) + '&rjson=true';
 
-    url = authenticatedUrl(url);
+    // ALPAC has a dedicated trailer resolver for exactly this scenario:
+    // TMDB YouTube id -> yt-dlp -> a stream that Lampa can play.
+    var trailerUrl = authenticatedUrl(
+      host + 'lite/trailer?id=' + encodeURIComponent(id)
+    );
 
     var net = new Lampa.Reguest();
-    // Lampa default is 30 s, while ALPAC yt-dlp extraction may legitimately
-    // take up to 60 s. Give it enough time before declaring a network error.
     net.timeout(120000);
-
     loading(true);
 
     net.silent(
-      url,
+      trailerUrl,
       function (json) {
-        loading(false);
+        var direct = json && json.url ? absoluteStream(host, json.url) : '';
 
-        var row = json && json.data && json.data.length ? json.data[0] : null;
-        var stream = row && (row.stream || row.url);
-
-        if (!stream) {
-          var detail = json && json.error ? ': ' + json.error : '';
-          showError('Трейлер: ALPAC не получил видео' + detail);
+        if (direct) {
+          loading(false);
+          log('resolved via /lite/trailer', id, direct);
+          playResolved(title, json, direct);
           return;
         }
 
-        var playItem = {
-          title: title,
-          url: stream,
-          stream: stream,
-          quality: row.quality || row.qualitys,
-          qualitys: row.qualitys || row.quality,
-          duration: row.duration,
-          hls_manifest_timeout: row.hls_manifest_timeout || 180000,
-          __alpac_trailer_resolved: true
-        };
-
-        if (row.audio) playItem.audio = row.audio;
-        if (row.dash) playItem.dash = row.dash;
-
-        log('resolved', id, stream);
-        originalPlay.call(Lampa.Player, playItem);
-
-        // The stock trailer code immediately sets a YouTube playlist after
-        // Player.play(). Replace it with the resolved stream once ready.
-        try {
-          if (originalPlaylist) originalPlaylist.call(Lampa.Player, [playItem]);
-        } catch (e) {}
+        // Some ALPAC nodes may not have the trailer route working even though
+        // the generic YouTube resolver does. Try that before showing an error.
+        log('/lite/trailer returned no URL, falling back to /lite/youtube', id);
+        resolveViaYoutube(host, id, title, function (ok, row, stream) {
+          loading(false);
+          if (ok && stream) {
+            log('resolved via /lite/youtube', id, stream);
+            playResolved(title, row, stream);
+          } else {
+            var detail = row && row.error ? ': ' + row.error : '';
+            showError('Трейлер: ALPAC не получил видео' + detail);
+          }
+        });
       },
       function (err) {
-        loading(false);
-        log('resolve failed', err);
-        showError('Трейлер: ошибка ALPAC при получении видео');
+        // If the dedicated endpoint itself is unavailable, still try the
+        // generic resolver used by ALPAC's YouTube search source.
+        log('/lite/trailer request failed, fallback', err);
+        resolveViaYoutube(host, id, title, function (ok, row, stream) {
+          loading(false);
+          if (ok && stream) {
+            playResolved(title, row, stream);
+          } else {
+            var detail = row && row.error ? ': ' + row.error : '';
+            showError('Трейлер: ошибка ALPAC' + detail);
+          }
+        });
       },
       false,
       { headers: requestHeaders() }
