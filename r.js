@@ -1,0 +1,1 @@
+(function(){if(window.rutube_trailer_plugin)return;var s=document.createElement('script');s.src='https://tvigl.github.io/plugins/rutube.js';s.async=true;s.onerror=function(){try{Lampa.Noty.show('Rutube trailer plugin: ошибка загрузки')}catch(e){}};(document.head||document.documentElement).appendChild(s)})();
